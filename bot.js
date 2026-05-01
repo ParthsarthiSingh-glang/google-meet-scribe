@@ -253,7 +253,22 @@ async function launchBot(meetingId, meetUrl, botName, db) {
     await debugScreenshot(page, 'after-join-click');
 
     // ===== STEP 5: WAIT TO BE ADMITTED =====
-    console.log('[Bot] Waiting to be admitted (up to 2 minutes)...');
+    // After clicking "Join now" on an open meeting, there's a transition period
+    console.log('[Bot] Waiting for meeting to load...');
+    await sleep(8000); // Give the meeting UI time to load after clicking join
+
+    await logPageInfo(page, 'After join wait');
+    await debugScreenshot(page, 'after-join-wait');
+
+    // Log all buttons currently on page (for debugging)
+    const postJoinButtons = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('button'))
+        .filter(b => b.offsetParent !== null)
+        .map(b => ({ text: (b.textContent || '').trim().substring(0, 40), ariaLabel: b.getAttribute('aria-label') }))
+        .slice(0, 20);
+    }).catch(() => []);
+    console.log('[Bot] Buttons after join:', JSON.stringify(postJoinButtons));
+
     let admitted = false;
     const joinStart = Date.now();
     const JOIN_TIMEOUT = 120000;
@@ -262,14 +277,23 @@ async function launchBot(meetingId, meetUrl, botName, db) {
       if (botState.stopRequested) break;
 
       try {
-        // Check for in-meeting indicators
+        // Check for in-meeting indicators (expanded list)
         const indicators = [
           'button[aria-label*="Leave call"]',
           'button[aria-label*="Leave meeting"]',
           'button[aria-label*="Turn on captions"]',
           'button[aria-label*="Turn off captions"]',
           'button[aria-label*="CC"]',
-          '[data-self-name]'
+          'button[aria-label*="Send a message"]',
+          'button[aria-label*="Present now"]',
+          'button[aria-label*="More options"]',
+          'button[aria-label*="Raise hand"]',
+          'button[aria-label*="Activities"]',
+          'button[aria-label*="Show everyone"]',
+          'button[aria-label*="Chat with everyone"]',
+          '[data-self-name]',
+          '[data-meeting-title]',
+          '[data-requested-participant]'
         ];
 
         for (const sel of indicators) {
@@ -282,37 +306,57 @@ async function launchBot(meetingId, meetUrl, botName, db) {
         }
         if (admitted) break;
 
-        // Check page text — but be more careful about false positives
+        // IMPORTANT: Check if the "Join now" button is GONE (meaning we transitioned to the meeting)
+        const joinBtnStillExists = await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          return buttons.some(b => {
+            const t = (b.textContent || '').trim().toLowerCase();
+            return (t === 'join now' || t === 'ask to join') && b.offsetParent !== null;
+          });
+        }).catch(() => false);
+
+        if (!joinBtnStillExists) {
+          // The join button is gone — check if name input is also gone
+          const nameInputGone = await page.$('input[placeholder="Your name"]') === null;
+          if (nameInputGone) {
+            // We're very likely in the meeting now
+            console.log('[Bot] ✅ IN THE MEETING! (join screen elements disappeared)');
+            admitted = true;
+            break;
+          }
+        }
+
+        // Check page text
         const pageText = await page.evaluate(() => document.body.innerText?.substring(0, 3000) || '').catch(() => '');
         const lower = pageText.toLowerCase();
 
-        // Positive signals that we're in the meeting
+        // Positive signals
         if (lower.includes("you're the only one here") ||
             lower.includes('you are the only one here') ||
             lower.includes('meeting is ready') ||
-            lower.includes('present now')) {
+            lower.includes('present now') ||
+            lower.includes('no one else is here') ||
+            lower.includes('people in the call') ||
+            lower.includes('meeting details')) {
           admitted = true;
           console.log('[Bot] ✅ IN THE MEETING! (detected via text)');
           break;
         }
 
-        // Negative signals — meeting is definitely not accessible
-        // Be very specific to avoid false positives
+        // Negative signals
         if (lower.includes("you can't join this meeting") ||
             lower.includes('this meeting has ended') ||
             lower.includes('check the meeting code') ||
             lower.includes('invalid meeting code') ||
             lower.includes('this video call has ended')) {
           await debugScreenshot(page, 'cannot-join');
-          throw new Error('Meeting is not accessible — check if the meeting is still active and the link is correct');
+          throw new Error('Meeting is not accessible');
         }
 
         // Waiting signals
         if (lower.includes('waiting for the host') ||
             lower.includes('asking to be let in') ||
-            lower.includes('someone in the meeting') ||
             lower.includes('waiting to be let in')) {
-          // Only log every 15 seconds
           if ((Date.now() - joinStart) % 15000 < 3000) {
             console.log('[Bot] ⏳ Waiting to be admitted by host...');
           }
@@ -328,7 +372,7 @@ async function launchBot(meetingId, meetUrl, botName, db) {
     if (!admitted) {
       await debugScreenshot(page, 'not-admitted');
       await logPageInfo(page, 'Not admitted - timeout');
-      throw new Error('Could not join meeting within 2 minutes. Please admit the bot manually or enable Quick Access.');
+      throw new Error('Could not join meeting within 2 minutes.');
     }
 
     // ===== STEP 6: WE'RE IN! =====
